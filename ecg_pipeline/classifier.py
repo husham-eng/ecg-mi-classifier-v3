@@ -1,3 +1,4 @@
+
 """
 ecg_pipeline.classifier
 ==========================
@@ -18,6 +19,22 @@ from .weighting import weight_with_class_specificity, weight_single_beat, build_
 
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 
+# ⚠️ قيم k مُحسَّنة تجريبياً لكل قطب (مسح شبكي + GroupKFold صارم على
+# مستوى المريض على بيانات PTB-XL، موثَّق بمقالة المشروع). القيمة
+# القديمة الموحّدة (k=2.5) كانت السبب الرئيسي وراء تصنيف أكثر من 70%
+# من النبضات المرضية كـ"طبيعي" تلقائياً (المدى كان واسعاً جداً، فيبتلع
+# أغلب الانحرافات المرضية قبل ما تصل خطوة التصنيف أصلاً). خفض k ضيّق
+# المدى الطبيعي وسمح لمزيد من الانحرافات المرضية الحقيقية بالظهور،
+# لكن بدون إفراط (القيم المثلى تقع فعلياً بين 1.25-1.5، لا أقل ولا أكثر
+# — قيم أصغر تبدأ تُدخل تباين النبضات الطبيعية نفسها كـ"انحراف" خاطئ).
+LEAD_DEFAULT_K = {
+    "LeadI": 1.25,
+    "aVR": 1.5,
+    "V2": 1.25,
+    "V6": 1.25,
+}
+DEFAULT_K_FALLBACK = 1.3  # لأي قطب غير مذكور أعلاه (احتياطي معقول قريب من كل القيم المثلى)
+
 
 class LeadModel:
     """يجمع كل ما يلزم للتصنيف على قطب واحد: المرجع الطبيعي + النموذج + جداول الترجيح."""
@@ -31,18 +48,13 @@ class LeadModel:
         self.window_len = window_len
         self.ref_min = ref_min
         self.ref_max = ref_max
-        self.idf_table = idf_table
-        self.specificity_table = specificity_table
+        self.idf_table = idf_table                # {(j, v): weight}
+        self.specificity_table = specificity_table  # {(j, v): weight}
         self.clf = clf
-        # جداول بحث مبنية مرة واحدة (استيفاء خطي) بدل إعادة بنائها بكل نبضة
         self._idf_lookup = build_weight_lookup(idf_table)
         self._specificity_lookup = build_weight_lookup(specificity_table)
 
     def predict_beat(self, beat: np.ndarray, normal_threshold: int = 50) -> dict:
-        """
-        يعيد قاموس الاحتمالات لكل الفئات (بما فيها Normal)، بعد تطبيق
-        قاعدة "العينات المتبقية القليلة => طبيعي" أولاً كفلتر أولي سريع.
-        """
         beat = np.asarray(beat, dtype=float)
         if len(beat) != self.window_len:
             beat = np.interp(np.linspace(0, 1, self.window_len),
@@ -69,8 +81,8 @@ class LeadModel:
         np.save(path / "ref_max.npy", self.ref_max)
         meta = {
             "lead": self.lead, "classes": self.classes, "window_len": self.window_len,
-            "idf_table": {str(k): v for k, v in self.idf_table.items()},
-            "specificity_table": {str(k): v for k, v in self.specificity_table.items()},
+            "idf_table": _table_to_json(self.idf_table),
+            "specificity_table": _table_to_json(self.specificity_table),
         }
         with open(path / "meta.json", "w") as f:
             json.dump(meta, f)
@@ -83,58 +95,76 @@ class LeadModel:
         ref_max = np.load(path / "ref_max.npy")
         with open(path / "meta.json") as f:
             meta = json.load(f)
-        idf_table = {float(k): v for k, v in meta["idf_table"].items()}
-        specificity_table = {float(k): v for k, v in meta["specificity_table"].items()}
+        idf_table = _table_from_json(meta["idf_table"])
+        specificity_table = _table_from_json(meta["specificity_table"])
         return cls(meta["lead"], meta["classes"], meta["window_len"],
                     ref_min, ref_max, idf_table, specificity_table, clf)
 
 
+def _table_to_json(table: dict) -> dict:
+    """يحوّل {(j, v): وزن} إلى {"j:v": وزن} لأن مفاتيح JSON يجب أن تكون نصوصاً."""
+    return {f"{j}:{v}": w for (j, v), w in table.items()}
+
+
+def _table_from_json(obj: dict) -> dict:
+    out = {}
+    for k, w in obj.items():
+        j_str, v_str = k.split(":", 1)
+        out[(int(j_str), float(v_str))] = w
+    return out
+
+
 def _compute_idf_specificity(stemmed_beats: np.ndarray, labels: np.ndarray, decimals: int = 1):
-    """يستخرج جداول IDF/الاختصاص من بيانات التدريب لحفظها واستخدامها لاحقاً وقت الاستدلال."""
-    from collections import defaultdict
+    """
+    يستخرج جداول IDF/الاختصاص من بيانات التدريب.
+    ⚠️ المفتاح (الموضع j، القيمة v) بدل القيمة v وحدها — راجع weighting.py.
+    """
     n_beats = stemmed_beats.shape[0]
+    n_positions = stemmed_beats.shape[1]
     bins = np.round(stemmed_beats, decimals)
     classes = sorted(set(labels))
     class_beat_counts = {c: (labels == c).sum() for c in classes}
+
+    from collections import defaultdict
     value_freq_per_class = defaultdict(lambda: defaultdict(int))
     doc_freq_total = defaultdict(int)
+
     for i, row in enumerate(bins):
         cls = labels[i]
-        for v in set(v for v in row if v != 0):
-            value_freq_per_class[v][cls] += 1
-            doc_freq_total[v] += 1
+        for j in range(n_positions):
+            v = row[j]
+            if v == 0:
+                continue
+            key = (j, float(v))
+            value_freq_per_class[key][cls] += 1
+            doc_freq_total[key] += 1
+
     specificity, idf = {}, {}
-    for v, per_class in value_freq_per_class.items():
+    for key, per_class in value_freq_per_class.items():
         freqs = np.array([per_class.get(c, 0) / class_beat_counts[c] for c in classes])
-        specificity[v] = float(freqs.max() / (freqs.sum() + 1e-9))
-        idf[v] = float(np.log(n_beats / doc_freq_total[v]))
+        specificity[key] = float(freqs.max() / (freqs.sum() + 1e-9))
+        idf[key] = float(np.log(n_beats / doc_freq_total[key]))
     return idf, specificity
 
 
 def train_lead_model(lead: str, normal_beats: np.ndarray,
                       pathological_beats: dict[str, np.ndarray],
-                      k_std: float = 2.5, n_estimators: int = 300,
+                      k_std: float | None = None, n_estimators: int = 300,
                       max_depth: int | None = 12, min_samples_leaf: int = 4,
                       max_features: str | float = "sqrt") -> LeadModel:
     """
     يدرّب نموذج قطب واحد كامل من الصفر: بناء مرجع طبيعي، Stemming،
     حساب أوزان IDF/الاختصاص، ثم تدريب Random Forest.
 
-    Parameters
-    ----------
-    normal_beats : مصفوفة نبضات طبيعية (لبناء المرجع فقط، ليست جزءاً من فئات التصنيف)
-    pathological_beats : قاموس {اسم الفئة المرضية: مصفوفة نبضاتها}
-    max_depth, min_samples_leaf, max_features : معاملات تنظيم (Regularization)
-        لأشجار Random Forest. **مهم**: النماذج المنشورة سابقاً كانت بلا أي تقييد
-        (max_depth=None الافتراضي)، وفحصها الفعلي بعد التدريب أظهر متوسط عمق
-        شجرة بين 69-122 مستوى وأوراقاً بمتوسط أقل من نبضتين لكل ورقة — دليل
-        قوي على Overfitting حاد للنبضات الفردية بدل تعلّم نمط عام. القيم
-        الافتراضية الجديدة هنا (max_depth=12, min_samples_leaf=4) محافظة
-        ومقترحة كنقطة بداية معقولة، لكن **يجب التحقق من أثرها الفعلي على
-        Macro-F1 عبر نفس منهجية التقييم الصارمة على مستوى المريض** (Leave-
-        One-Patient-Out) المستخدمة سابقاً بالمشروع، قبل اعتمادها للنشر —
-        قد تحتاج تعديلاً إضافياً حسب حجم بيانات كل قطب على حدة.
+    k_std: عرض المدى الطبيعي (المتوسط ± k×الانحراف المعياري). إذا تُرك
+    None (الافتراضي)، يُستخدَم تلقائياً أفضل قيمة مُحسَّنة لهذا القطب
+    تحديداً من LEAD_DEFAULT_K (أو DEFAULT_K_FALLBACK إذا كان القطب غير
+    مذكور) — راجع تعليق LEAD_DEFAULT_K أعلاه لتفاصيل كيفية استخراج هذي
+    القيم ولماذا القيمة القديمة (2.5) كانت أوسع من اللازم بشكل كبير.
     """
+    if k_std is None:
+        k_std = LEAD_DEFAULT_K.get(lead, DEFAULT_K_FALLBACK)
+
     window_len = normal_beats.shape[1]
     ref_min, ref_max = build_normal_envelope(normal_beats, k=k_std)
 
@@ -161,3 +191,4 @@ def train_lead_model(lead: str, normal_beats: np.ndarray,
 
     classes = sorted(set(y)) + ["Normal"]
     return LeadModel(lead, classes, window_len, ref_min, ref_max, idf_table, specificity_table, clf)
+

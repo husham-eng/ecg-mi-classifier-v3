@@ -1,8 +1,19 @@
+
 """
 ecg_pipeline.weighting
 =========================
 تطبيع وترجيح السمات (TF-IDF + قمع التداخل بين الفئات / Class Specificity)
 المُطبَّق على النبضات بعد Stemming.
+
+⚠️ إصلاح جوهري (موثَّق بتفصيل بمقالة المشروع، قسم "منهجية التصحيح"):
+النسخة السابقة كانت تحسب الوزن بالاعتماد على *قيمة الانحراف فقط*
+(value)، متجاهلة تماماً *موضعها* (j) داخل النبضة — أي جزء من دورة
+القلب حدث فيه هذا الانحراف (QRS مقابل ST مقابل موجة T). هذا كان يُسوّي
+كل الإشارة الزمنية الغنية إلى دالة أحادية البعد للقيمة فقط، ويطمس
+بالضبط المعلومة المكانية-الزمنية المميّزة لأنواع الاحتشاء المختلفة.
+
+الإصلاح: هوية "السمة" أصبحت الزوج (موضع j، قيمة v) بدل القيمة v وحدها.
+النتيجة: جدول ترجيح لكل موضع على حدة، بدل جدول عام واحد للنبضة كاملة.
 """
 
 from __future__ import annotations
@@ -13,93 +24,98 @@ from collections import defaultdict
 def weight_with_class_specificity(stemmed_beats: np.ndarray, labels: np.ndarray,
                                    decimals: int = 1) -> np.ndarray:
     """
-    يجمع بين:
-      (أ) IDF التقليدي: وزن أعلى للقيم النادرة عبر كل النبضات.
-      (ب) الاختصاص الطبقي: وزن أعلى للقيم "المختصة" بفئة واحدة، ووزن
-          أقل للقيم المشتركة بقوة بين عدة فئات مرضية (لأنها لا تميّز).
+    نفس فكرة IDF + الاختصاص الطبقي بالنسخة القديمة، لكن محسوبة **لكل موضع
+    على حدة** بدل تجميع كل مواضع النبضة معاً.
     """
     n_beats = stemmed_beats.shape[0]
+    n_positions = stemmed_beats.shape[1]
     bins = np.round(stemmed_beats, decimals)
     classes = sorted(set(labels))
-
     class_beat_counts = {c: (labels == c).sum() for c in classes}
+
     value_freq_per_class = defaultdict(lambda: defaultdict(int))
     doc_freq_total = defaultdict(int)
 
     for i, row in enumerate(bins):
         cls = labels[i]
-        uniq = set(v for v in row if v != 0)
-        for v in uniq:
-            value_freq_per_class[v][cls] += 1
-            doc_freq_total[v] += 1
+        for j in range(n_positions):
+            v = row[j]
+            if v == 0:
+                continue
+            key = (j, float(v))
+            value_freq_per_class[key][cls] += 1
+            doc_freq_total[key] += 1
 
     specificity, idf = {}, {}
-    for v, per_class in value_freq_per_class.items():
+    for key, per_class in value_freq_per_class.items():
         freqs = np.array([per_class.get(c, 0) / class_beat_counts[c] for c in classes])
-        specificity[v] = freqs.max() / (freqs.sum() + 1e-9)
-        idf[v] = np.log(n_beats / doc_freq_total[v])
+        specificity[key] = freqs.max() / (freqs.sum() + 1e-9)
+        idf[key] = np.log(n_beats / doc_freq_total[key])
 
     weighted = np.zeros_like(stemmed_beats)
     for i, row in enumerate(bins):
-        for j, v in enumerate(row):
-            if v != 0:
-                weighted[i, j] = stemmed_beats[i, j] * idf.get(v, 0.0) * specificity.get(v, 0.0)
+        for j in range(n_positions):
+            v = row[j]
+            if v == 0:
+                continue
+            key = (j, float(v))
+            weighted[i, j] = stemmed_beats[i, j] * idf.get(key, 0.0) * specificity.get(key, 0.0)
     return weighted
 
 
-def build_weight_lookup(table: dict) -> tuple[np.ndarray, np.ndarray]:
+def build_weight_lookup(table: dict) -> dict:
     """
-    يحوّل جدول ترجيح (idf_table أو specificity_table) من قاموس {قيمة: وزن}
-    إلى زوج مصفوفات مرتّبة (مفاتيح، أوزان) جاهزة للاستيفاء الخطي.
-    يُستدعى مرة واحدة فقط عند تحميل النموذج (وليس بكل نبضة) لأسباب أداء.
+    يحوّل جدول ترجيح {(j, v): وزن} إلى قاموس لكل موضع على حدة:
+        {j: (مصفوفة قيم مرتّبة, مصفوفة أوزان مقابلة)}
+    جاهز للاستيفاء الخطي **داخل نفس الموضع فقط** — لا نستوفي أبداً بين
+    مواضع مختلفة، لأن قيمة انحراف عند موضع QRS لا معنى لمقارنتها بموضع
+    الموجة T حتى لو تصادف تساويهما رقمياً.
     """
-    if not table:
-        return np.array([]), np.array([])
-    keys = np.array(sorted(table.keys()), dtype=float)
-    values = np.array([table[k] for k in keys], dtype=float)
-    return keys, values
+    per_position = defaultdict(dict)
+    for key, weight in table.items():
+        j, v = key
+        per_position[j][v] = weight
+
+    lookup = {}
+    for j, value_weight_map in per_position.items():
+        keys = np.array(sorted(value_weight_map.keys()), dtype=float)
+        values = np.array([value_weight_map[k] for k in keys], dtype=float)
+        lookup[j] = (keys, values)
+    return lookup
 
 
-def lookup_weight(v: float, lookup: tuple[np.ndarray, np.ndarray]) -> float:
+def lookup_weight(position: int, v: float, lookup: dict) -> float:
     """
-    يبحث عن وزن القيمة v ضمن جدول مُجهَّز مسبقاً بـ build_weight_lookup.
-
-    لماذا الاستيفاء لا البحث الحرفي: قيم الانحراف بعد Stemming مستمرة
-    الطبيعة (مثلاً 0.35 مم انحراف عن الطبيعي)، وليست فئات منفصلة محدودة.
-    مريض جديد سيُنتج غالباً قيماً لم تظهر حرفياً بجدول التدريب (خصوصاً مع
-    عيّنة تدريب محدودة الحجم). النسخة القديمة كانت تُرجع صفراً في هذه
-    الحالة (dict.get(v, 0.0)) — أي تتعامل مع أي انحراف "غريب" على أنه
-    عديم الأهمية الطبية، حتى لو كان أشد خطورة من أي قيمة شوهدت بالتدريب.
-    الاستيفاء الخطي بين أقرب قيمتين مُشاهدتين يحافظ على الاتجاه الصحيح
-    فيزيولوجياً (انحراف أكبر => وزن أكبر عادة)، ويُثَبِّت القيمة عند طرفي
-    المدى المُشاهَد بدل الصفر في الحالات الطرفية جداً.
+    يبحث عن وزن القيمة v عند الموضع المحدد، بالاستيفاء الخطي بين أقرب
+    قيمتين *شوهدتا عند نفس الموضع بالتدريب*. لو الموضع نفسه لم يُشاهَد
+    نشطاً إطلاقاً بالتدريب، نُرجع 0.0 بدل استيفاء مضلِّل من موضع مختلف.
     """
-    keys, values = lookup
+    if position not in lookup:
+        return 0.0
+    keys, values = lookup[position]
     if len(keys) == 0:
         return 0.0
+    if len(keys) == 1:
+        return float(values[0])
     return float(np.interp(v, keys, values))
 
 
-def weight_single_beat(stemmed_beat: np.ndarray, idf_lookup, specificity_lookup,
+def weight_single_beat(stemmed_beat: np.ndarray, idf_lookup: dict, specificity_lookup: dict,
                         decimals: int = 1) -> np.ndarray:
     """
-    يطبّق أوزان IDF/الاختصاص المحسوبة مسبقاً وقت التدريب على نبضة واحدة
-    جديدة وقت الاستدلال، عبر استيفاء خطي بدل مطابقة حرفية.
+    يطبّق أوزان IDF/الاختصاص المحسوبة مسبقاً (واعية بالموضع) على نبضة
+    واحدة جديدة وقت الاستدلال.
 
-    idf_lookup / specificity_lookup: إما قاموس خام {قيمة: وزن} (يُحوَّل
-    تلقائياً)، أو زوج مصفوفات جاهز من build_weight_lookup (أسرع، مفضّل
-    عند التصنيف المتكرر لعدة نبضات).
+    idf_lookup / specificity_lookup: يجب أن يكونا ناتج build_weight_lookup
+    الجاهز مسبقاً — ابنِهما مرة واحدة عند تحميل/تدريب النموذج (كما تفعل
+    LeadModel.__init__)، لا بكل استدعاء، لأسباب أداء.
     """
-    if isinstance(idf_lookup, dict):
-        idf_lookup = build_weight_lookup(idf_lookup)
-    if isinstance(specificity_lookup, dict):
-        specificity_lookup = build_weight_lookup(specificity_lookup)
-
     bins = np.round(stemmed_beat, decimals)
     weighted = np.zeros_like(stemmed_beat)
     for j, v in enumerate(bins):
         if v != 0:
             weighted[j] = (stemmed_beat[j]
-                           * lookup_weight(v, idf_lookup)
-                           * lookup_weight(v, specificity_lookup))
+                           * lookup_weight(j, v, idf_lookup)
+                           * lookup_weight(j, v, specificity_lookup))
     return weighted
+
