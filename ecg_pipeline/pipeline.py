@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .preprocessing import process_raw_signal, denoise, remove_baseline, detect_r_peaks
+from .preprocessing import process_raw_signal, denoise, remove_baseline_highpass, detect_r_peaks
 from .classifier import LeadModel, MODELS_DIR
 from .image_digitizer import extract_trace_from_image, calibrate_signal
 
@@ -55,22 +55,35 @@ def classify_lead_signal(raw_signal: np.ndarray, fs: float, lead: str,
     beat_index=None (الافتراضي): يصنّف كل نبضة مكتشفة على حدة ثم يُرجع
     متوسط الاحتمالات عبرها (انظر توثيق n_beats_used وbeat_agreement).
     beat_index=<رقم>: نبضة واحدة محددة صراحة (اختبارات/تصحيح أخطاء).
+
+    ⚠️ إصلاح جوهري (جلسة تشخيص طول النافذة): process_raw_signal يرجع
+    الآن نقطة قطع ديناميكية لكل نبضة (cutoffs) بجانب النبضات ومواقع R،
+    تُمرَّر إجبارياً لـ predict_beat حتى لا يقارن أي جزء من نبضة يتجاوز
+    بداية النبضة التالية فعلياً (خصوصاً عند مرضى نبضهم سريع) بالمرجع.
+
+    النتيجة تتضمّن أيضاً "representative_beat" (النبضة المستخدَمة فعلياً
+    فأول نبضة مكتشفة، أو المحدَّدة عبر beat_index) + المدى الطبيعي لهذا
+    القطب (ref_min/ref_max) ونقطة قطعها -- جاهزة مباشرة لأي رسم بياني
+    لاحق (مثلاً تقرير الإيميل عبر ecg_pipeline.email_report) بلا حاجة
+    لإعادة استخراجها من الصفر.
     """
     model = get_model(lead)
     pre = model.window_len * 200 // 800  # نسبة قياسية مطابقة لنافذة التدريب (±400ms عند fs=1000)
     post = model.window_len - pre
-    beats, r_locs = process_raw_signal(raw_signal, fs, pre=pre, post=post,
-                                        external_r_locs=external_r_locs)
+    beats, r_locs, cutoffs = process_raw_signal(raw_signal, fs, pre=pre, post=post,
+                                                 external_r_locs=external_r_locs)
     if len(beats) == 0:
         return {"error": "لم يتم اكتشاف أي نبضة صالحة بهذا القطب — تحقق من جودة الإشارة."}
 
     if beat_index is not None:
         idx = min(beat_index, len(beats) - 1)
-        probs = model.predict_beat(beats[idx])
+        probs = model.predict_beat(beats[idx], cutoff=cutoffs[idx])
         return {"lead": lead, "n_beats_detected": len(beats), "n_beats_used": 1,
-                "probabilities": probs}
+                "probabilities": probs,
+                "representative_beat": beats[idx], "representative_cutoff": int(cutoffs[idx]),
+                "ref_min": model.ref_min, "ref_max": model.ref_max}
 
-    all_probs = [model.predict_beat(b) for b in beats]
+    all_probs = [model.predict_beat(b, cutoff=c) for b, c in zip(beats, cutoffs)]
     classes = set()
     for p in all_probs:
         classes.update(p.keys())
@@ -86,6 +99,9 @@ def classify_lead_signal(raw_signal: np.ndarray, fs: float, lead: str,
         "n_beats_used": len(beats),
         "beat_agreement": round(agreement, 3),
         "probabilities": mean_probs,
+        # نبضة تمثيلية (الأولى المكتشفة) + مدى القطب الطبيعي، لأي عرض بياني لاحق
+        "representative_beat": beats[0], "representative_cutoff": int(cutoffs[0]),
+        "ref_min": model.ref_min, "ref_max": model.ref_max,
     }
 
 
@@ -173,7 +189,7 @@ def classify_patient(signals_by_lead: dict[str, tuple[np.ndarray, float]],
     external_r_locs = None
     if reference_lead_signal is not None:
         ref_raw, ref_fs = reference_lead_signal
-        ref_clean = remove_baseline(denoise(ref_raw, ref_fs), degree=6)
+        ref_clean = remove_baseline_highpass(denoise(ref_raw, ref_fs), ref_fs)
         external_r_locs = detect_r_peaks(ref_clean, ref_fs, polarity_robust=True)
 
     per_lead_results = {}

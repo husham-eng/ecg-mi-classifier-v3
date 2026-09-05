@@ -30,6 +30,7 @@ from werkzeug.utils import secure_filename
 from ecg_pipeline import (classify_patient, classify_from_image, classify_lead_signal,
                            combine_lead_probabilities, SUPPORTED_LEADS)
 from ecg_pipeline.panel_detector import detect_panel_leads
+from ecg_pipeline.email_report import generate_and_send_report, SMTPConfig
 from translations import get_translation, DEFAULT_LANG
 
 app = Flask(__name__)
@@ -39,6 +40,16 @@ app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024  # 20MB حد أقصى لكل
 # (Render: تبويب Environment)، لا تعتمد على القيم الافتراضية بالإنتاج.
 app.secret_key = os.environ.get("SECRET_KEY", "dev-only-change-me-on-render")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "changeme123")
+
+# ⚠️ ميزة تقرير الإيميل (جلسة الدراسة الميدانية): تحتاج متغيّرات بيئة
+# ECG_SMTP_HOST / ECG_SMTP_PORT / ECG_SMTP_USERNAME / ECG_SMTP_PASSWORD
+# (راجع توثيق SMTPConfig.from_env بـ ecg_pipeline/email_report.py). إن لم
+# تُضبَط، تبقى الميزة معطَّلة تلقائياً (لا خطأ يوقف التطبيق) -- أي طلب فيه
+# doctor_email سيُرجع تحذيراً بالنتيجة بدل إرسال فعلي، حتى تُضبَط الإعدادات.
+try:
+    _SMTP_CONFIG = SMTPConfig.from_env()
+except KeyError:
+    _SMTP_CONFIG = None
 
 # ⚠️ تنبيه مهم: هذا المجلد على قرص مؤقت (Ephemeral) بمعظم منصات الاستضافة
 # المجانية (بما فيها Render Free) — يُمسَح بالكامل عند كل إعادة نشر أو
@@ -182,9 +193,9 @@ def classify():
 
     external_r_locs = None
     if reference_lead_signal is not None:
-        from ecg_pipeline.preprocessing import denoise, remove_baseline, detect_r_peaks
+        from ecg_pipeline.preprocessing import denoise, remove_baseline_highpass, detect_r_peaks
         ref_raw, ref_fs = reference_lead_signal
-        ref_clean = remove_baseline(denoise(ref_raw, ref_fs), degree=6)
+        ref_clean = remove_baseline_highpass(denoise(ref_raw, ref_fs), ref_fs)
         external_r_locs = detect_r_peaks(ref_clean, ref_fs, polarity_robust=True)
 
     for lead in SUPPORTED_LEADS:
@@ -243,6 +254,44 @@ def classify():
     if "error" not in result:
         result["reference_lead_alignment_used"] = reference_lead_signal is not None
     result["errors"] = errors
+
+    # ⚠️ ميزة تقرير الإيميل (جلسة الدراسة الميدانية): نستخرج بيانات الرسم
+    # البياني (النبضة الفعلية + المدى الطبيعي + نقطة القطع) من per_lead_results
+    # *قبل* حذفها لاحقاً من النتيجة (numpy arrays غير قابلة للتحويل لـJSON
+    # مباشرة عبر jsonify -- راجع الحذف أدناه).
+    doctor_email = (request.form.get("doctor_email") or "").strip()
+    if doctor_email and "error" not in result:
+        lead_results_for_email = {}
+        for lead, r in per_lead_results.items():
+            if "error" in r or "representative_beat" not in r:
+                continue
+            lead_results_for_email[lead] = {
+                "predicted": max(r["probabilities"], key=r["probabilities"].get),
+                "probs": r["probabilities"],
+                "beat": r["representative_beat"],
+                "ref_min": r["ref_min"],
+                "ref_max": r["ref_max"],
+                "cutoff": r["representative_cutoff"],
+            }
+        if lead_results_for_email:
+            if _SMTP_CONFIG is None:
+                result["email_status"] = ("لم يُرسَل: إعدادات SMTP غير مضبوطة على السيرفر "
+                                           "(راجع متغيّرات ECG_SMTP_* بالبيئة).")
+            else:
+                try:
+                    generate_and_send_report(_SMTP_CONFIG, doctor_email,
+                                              patient_label=f"recording_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}",
+                                              lead_results=lead_results_for_email)
+                    result["email_status"] = f"أُرسل تقرير مفصَّل إلى {doctor_email}."
+                except Exception as e:
+                    result["email_status"] = f"تعذّر إرسال الإيميل: {e}"
+
+    # نحذف الآن أي مصفوفات numpy خام من النتيجة قبل log_attempt/jsonify --
+    # كانت ضرورية فقط للحظة إعداد الإيميل أعلاه، وغير قابلة للتحويل لـJSON.
+    for r in per_lead_results.values():
+        r.pop("representative_beat", None)
+        r.pop("ref_min", None)
+        r.pop("ref_max", None)
 
     log_attempt("classify", raw_files_for_log, result)
     return jsonify(result)

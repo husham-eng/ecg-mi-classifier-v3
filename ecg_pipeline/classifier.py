@@ -54,13 +54,25 @@ class LeadModel:
         self._idf_lookup = build_weight_lookup(idf_table)
         self._specificity_lookup = build_weight_lookup(specificity_table)
 
-    def predict_beat(self, beat: np.ndarray, normal_threshold: int = 50) -> dict:
+    def predict_beat(self, beat: np.ndarray, normal_threshold: int = 50,
+                      cutoff: int | None = None) -> dict:
+        """
+        cutoff: نقطة القطع الديناميكية الخاصة بهذي النبضة (ناتج
+        preprocessing.compute_dynamic_cutoff، مبنية على مسافتها الفعلية
+        لقمة R التالية). اتركه None (الافتراضي) لسلوك قديم مطابق تماماً
+        (نافذة كاملة، بلا قطع) -- مناسب لأي استدعاء لا يعرف بعد أين تقع
+        النبضة التالية (مثلاً نبضة تصل بزمن حقيقي). راجع ملاحظة القيد
+        المعماري بتوثيق preprocessing.compute_dynamic_cutoff.
+        """
         beat = np.asarray(beat, dtype=float)
-        if len(beat) != self.window_len:
+        original_len = len(beat)
+        if original_len != self.window_len:
             beat = np.interp(np.linspace(0, 1, self.window_len),
-                              np.linspace(0, 1, len(beat)), beat)
+                              np.linspace(0, 1, original_len), beat)
+            if cutoff is not None:
+                cutoff = int(round(cutoff * self.window_len / original_len))
 
-        stemmed = stem_beat(beat, self.ref_min, self.ref_max)
+        stemmed = stem_beat(beat, self.ref_min, self.ref_max, cutoff=cutoff)
 
         if is_likely_normal(stemmed, threshold=normal_threshold):
             probs = {c: 0.0 for c in self.classes}
@@ -151,7 +163,9 @@ def train_lead_model(lead: str, normal_beats: np.ndarray,
                       pathological_beats: dict[str, np.ndarray],
                       k_std: float | None = None, n_estimators: int = 300,
                       max_depth: int | None = 12, min_samples_leaf: int = 4,
-                      max_features: str | float = "sqrt") -> LeadModel:
+                      max_features: str | float = "sqrt",
+                      normal_cutoffs: np.ndarray | None = None,
+                      pathological_cutoffs: dict[str, np.ndarray] | None = None) -> LeadModel:
     """
     يدرّب نموذج قطب واحد كامل من الصفر: بناء مرجع طبيعي، Stemming،
     حساب أوزان IDF/الاختصاص، ثم تدريب Random Forest.
@@ -161,17 +175,27 @@ def train_lead_model(lead: str, normal_beats: np.ndarray,
     تحديداً من LEAD_DEFAULT_K (أو DEFAULT_K_FALLBACK إذا كان القطب غير
     مذكور) — راجع تعليق LEAD_DEFAULT_K أعلاه لتفاصيل كيفية استخراج هذي
     القيم ولماذا القيمة القديمة (2.5) كانت أوسع من اللازم بشكل كبير.
+
+    normal_cutoffs / pathological_cutoffs: نقاط القطع الديناميكية (ناتج
+    preprocessing.compute_dynamic_cutoff) بنفس شكل normal_beats/
+    pathological_beats على التوالي (pathological_cutoffs قاموس بنفس
+    مفاتيح pathological_beats). اتركهما None (الافتراضي) لتعطيل القطع
+    الديناميكي كلياً -- تدريب مطابق تماماً للسلوك القديم بلا أي تغيير.
     """
     if k_std is None:
         k_std = LEAD_DEFAULT_K.get(lead, DEFAULT_K_FALLBACK)
 
     window_len = normal_beats.shape[1]
-    ref_min, ref_max = build_normal_envelope(normal_beats, k=k_std)
+    ref_min, ref_max = build_normal_envelope(normal_beats, k=k_std, cutoffs=normal_cutoffs)
 
     X, y = [], []
     for cls, beats in pathological_beats.items():
-        for b in beats:
-            X.append(stem_beat(b, ref_min, ref_max))
+        cutoffs_for_cls = None
+        if pathological_cutoffs is not None:
+            cutoffs_for_cls = pathological_cutoffs.get(cls)
+        for i, b in enumerate(beats):
+            c = cutoffs_for_cls[i] if cutoffs_for_cls is not None else None
+            X.append(stem_beat(b, ref_min, ref_max, cutoff=c))
             y.append(cls)
     X = np.array(X)
     y = np.array(y)

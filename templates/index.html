@@ -133,6 +133,12 @@
       <input type="number" name="fs_II" value="500">
     </div>
 
+    <div class="lead-box" style="background:var(--bg-soft);">
+      <label>{{ t.doctor_email_label }}</label>
+      <input type="email" name="doctor_email" id="doctorEmailInput" placeholder="doctor@example.com">
+      <p class="hint">{{ t.doctor_email_hint }}</p>
+    </div>
+
     <p class="intro-text">{{ t.intro_text | safe }}</p>
 
     <div class="leads-grid">
@@ -229,6 +235,8 @@
         const blob = base64ToBlob(info.image_b64);
         formData.append(`file_${lead}`, blob, `${lead}.png`);
       }
+      const doctorEmail = document.getElementById('doctorEmailInput').value;
+      if (doctorEmail) formData.append('doctor_email', doctorEmail);
 
       try {
         const res = await fetch('/classify', { method: 'POST', body: formData });

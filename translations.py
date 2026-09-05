@@ -47,6 +47,8 @@ TRANSLATIONS = {
                         "بدقة أعلى عبر كل الأقطاب المرفوعة أدناه.",
         "lead_ii_file_label": "ملف إشارة Lead II (CSV/TXT فقط):",
         "fs_label": "معدل العينات Hz:",
+        "doctor_email_label": "البريد الإلكتروني لإرسال التقرير (اختياري):",
+        "doctor_email_hint": "إن أدخلته، سيُرسَل تقرير مفصَّل (أشكال + جداول احتمالات) فور اكتمال التصنيف — لمراجعة الطبيب/الفني بدراسة التحقق الميداني.",
         "intro_text": "ارفع ملف إشارة (CSV/TXT) أو صورة مخطط (JPG/PNG) لقطب واحد أو أكثر من "
                       "الأقطاب المدعومة أدناه. <strong>كل قطب يحتاج ملفه/صورته الخاصة والمختلفة "
                       "عن غيره.</strong> كل ما زاد عدد الأقطاب المرفوعة، كل ما كان القرار "
@@ -123,6 +125,8 @@ TRANSLATIONS = {
                         "all leads uploaded below.",
         "lead_ii_file_label": "Lead II signal file (CSV/TXT only):",
         "fs_label": "Sampling rate (Hz):",
+        "doctor_email_label": "Email address for report (optional):",
+        "doctor_email_hint": "If provided, a detailed report (charts + probability tables) will be emailed immediately after classification — for field-study / clinician review.",
         "intro_text": "Upload a signal file (CSV/TXT) or a strip image (JPG/PNG) for one or "
                       "more of the supported leads below. <strong>Each lead needs its own, "
                       "distinct file/image.</strong> The more leads you upload, the more "
@@ -206,6 +210,8 @@ TRANSLATIONS = {
                         "сердечных циклов по всем отведениям, загруженным ниже.",
         "lead_ii_file_label": "Файл сигнала Lead II (только CSV/TXT):",
         "fs_label": "Частота дискретизации (Гц):",
+        "doctor_email_label": "Email для отчёта (необязательно):",
+        "doctor_email_hint": "Если указан, подробный отчёт (графики + таблицы вероятностей) будет отправлен по email сразу после классификации — для проверки врачом.",
         "intro_text": "Загрузите файл сигнала (CSV/TXT) или изображение полосы (JPG/PNG) для "
                       "одного или нескольких поддерживаемых отведений ниже. <strong>Каждому "
                       "отведению нужен свой собственный, отдельный файл/изображение.</strong> "

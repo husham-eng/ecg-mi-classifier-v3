@@ -3,8 +3,19 @@ load_ptbxl_data.py
 =====================
 يحمّل بيانات PTB-XL الخام (ملفات WFDB .dat/.hea) من ptbxl_selection/<فئة>/،
 يستخرج الإشارة الخام لكل قطب مدعوم (LeadI, aVR, V2, V6)، يمرّرها بخط
-المعالجة الحالي (denoise -> remove_baseline -> detect R -> extract beats)،
-ويُرجع كل النبضات مع (patient_id, label, lead) لاستخدامها بالتدريب والتقييم.
+المعالجة الحالي (تمرير عالٍ -> تصحيح محلي PR -> اكتشاف R -> تقطيع ->
+قطع ديناميكي حسب RR)، ويُرجع كل النبضات مع (patient_id, label, lead,
+beat, cutoff_idx) لاستخدامها بالتدريب والتقييم.
+
+⚠️ إصلاح جوهري (جلسة تشخيص المحازاة): مواقع R تُكتشَف الآن عبر **إجماع
+كل الأقطاب المتاحة بالتسجيل** (detect_r_consensus)، بدل الاعتماد على
+Lead II وحده كمرجع — أثبت هذا تحسيناً بجودة المحازاة، خصوصاً بفئتي
+الاحتشاء السفلي IL/IPL حيث Lead II نفسه (كونه قطباً سفلياً) قد يتشوّه
+بنفس المرض المطلوب تمييزه، فيصبح مرجعاً غير موثوق لتلك الفئات تحديداً.
+
+⚠️ عمود إضافي: "cutoff_idx" -- نقطة القطع الديناميكية الخاصة بكل نبضة
+(راجع preprocessing.compute_dynamic_cutoff)، إجباري تمريره لاحقاً لـ
+classifier.train_lead_model (كـnormal_cutoffs/pathological_cutoffs).
 """
 
 from __future__ import annotations
@@ -17,9 +28,8 @@ import wfdb
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from ecg_pipeline.preprocessing import process_raw_signal, denoise, remove_baseline, detect_r_peaks
-
-REFERENCE_LEAD = "II"  # القطب المرجعي لاكتشاف مواقع R (الأوضح غالباً سريرياً)
+from ecg_pipeline.preprocessing import (process_raw_signal, denoise, remove_baseline_highpass,
+                                         detect_r_peaks, detect_r_consensus)
 
 # مطابقة اسم مجلد الفئة بـPTB-XL مع رمز الفئة المستخدم بالمشروع الحالي
 CATEGORY_TO_LABEL = {
@@ -56,8 +66,9 @@ def extract_ecg_id(hea_path: Path) -> int:
 def load_all_beats(selection_dir: Path, database_csv: Path,
                     pre: int = 100, post: int = 300, verbose: bool = True) -> pd.DataFrame:
     """
-    يرجع DataFrame بعمود لكل: patient_id, ecg_id, label, lead, beat (np.ndarray)
-    لكل نبضة مكتشفة، لكل قطب مدعوم، لكل سجل ضمن الفئات المستخدمة حالياً.
+    يرجع DataFrame بعمود لكل: patient_id, ecg_id, label, lead, beat (np.ndarray),
+    cutoff_idx (int) لكل نبضة مكتشفة، لكل قطب مدعوم، لكل سجل ضمن الفئات
+    المستخدمة حالياً.
     """
     meta = load_metadata(database_csv)
     rows = []
@@ -86,25 +97,28 @@ def load_all_beats(selection_dir: Path, database_csv: Path,
             fs = record.fs
             sig_names = record.sig_name
 
-            # اكتشاف مواقع R مرة واحدة من القطب المرجعي (Lead II)، بمقاومة
-            # لانعكاس القطبية — تُستخدم نفس المواقع لاستخراج كل الأقطاب
-            # الأربعة المدعومة، فتُضمَن محازاة فعلية بين الأقطاب لنفس النبضة.
-            if REFERENCE_LEAD not in sig_names:
-                continue
-            ref_raw = record.p_signal[:, sig_names.index(REFERENCE_LEAD)]
-            ref_clean = remove_baseline(denoise(ref_raw, fs), degree=6)
-            ref_r_locs = detect_r_peaks(ref_clean, fs, polarity_robust=True)
+            # ✅ إجماع كل الأقطاب المتاحة بالتسجيل بدل الاعتماد على Lead II وحده
+            # (يستخدم إزالة أساس بتمرير عالٍ للاتساق الكامل مع process_raw_signal)
+            candidates_per_lead = {}
+            for name in sig_names:
+                sig = record.p_signal[:, sig_names.index(name)]
+                clean = remove_baseline_highpass(denoise(sig, fs), fs)
+                candidates_per_lead[name] = detect_r_peaks(clean, fs, polarity_robust=True)
+            consensus_r_locs = detect_r_consensus(candidates_per_lead, len(sig_names),
+                                                   cluster_window_samples=int(0.08 * fs))
+            if len(consensus_r_locs) == 0:
+                continue  # لم يتفق أي عدد كافٍ من الأقطاب على أي نبضة — تسجيل رديء الجودة، يُتجاهَل
 
             for lead, wfdb_name in LEAD_NAME_MAP.items():
                 if wfdb_name not in sig_names:
                     continue
                 raw = record.p_signal[:, sig_names.index(wfdb_name)]
-                beats, r_locs = process_raw_signal(raw, fs, pre=pre, post=post,
-                                                    external_r_locs=ref_r_locs)
-                for b in beats:
+                beats, r_locs, cutoffs = process_raw_signal(raw, fs, pre=pre, post=post,
+                                                              external_r_locs=consensus_r_locs)
+                for b, cutoff in zip(beats, cutoffs):
                     rows.append({
                         "patient_id": patient_id, "ecg_id": ecg_id,
-                        "label": label, "lead": lead, "beat": b,
+                        "label": label, "lead": lead, "beat": b, "cutoff_idx": int(cutoff),
                     })
 
         if verbose:
@@ -123,4 +137,4 @@ if __name__ == "__main__":
     print(f"\nإجمالي النبضات المستخرجة: {len(df)}")
     print(df.groupby(["lead", "label"])["patient_id"].nunique())
     df.to_pickle("/home/claude/ecg_app/ptbxl_beats.pkl")
-    print("\n✅ حُفظت كل النبضات بـ ptbxl_beats.pkl")
+    print("\n✅ حُفظت كل النبضات (مع cutoff_idx) بـ ptbxl_beats.pkl")
