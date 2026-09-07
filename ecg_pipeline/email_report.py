@@ -11,77 +11,77 @@ ecg_pipeline.email_report
 بدالة واحدة `generate_and_send_report(...)` من أي مكان بالتطبيق الحالي
 فور اكتمال التصنيف. لا يحتاج معرفة كيف يعمل باقي التطبيق.
 
-⚠️ يستخدم SMTP عادي (smtplib، مكتبة قياسية بلا تبعيات خارجية) بما إنه
-لا توجد آلية إرسال بريد مفعَّلة حالياً. يحتاج:
-  - حساب بريد مع "كلمة مرور تطبيق" (App Password) -- ليس كلمة المرور
-    العادية، خصوصاً لو Gmail (يُفعَّل من إعدادات الحساب Google → الأمان
-    → التحقق بخطوتين → كلمات مرور التطبيقات).
-  - أو خادم SMTP خاص بالشركة/الجهة إذا متوفر.
+⚠️ إصلاح جوهري (جلسة تشخيص فشل الإرسال بالإنتاج): النسخة الأولى استخدمت
+SMTP عادي (smtplib) عبر المنفذ 587 -- اكتُشِف بالتجربة الفعلية أن Render
+(ومعظم منصات الاستضافة السحابية المجانية) **يحجب المنافذ الصادرة الخاصة
+بالبريد** (25/465/587) لمنع إساءة الاستخدام كمصدر سبام، بغض النظر عن صحة
+بيانات الاعتماد. النتيجة: محاولة الاتصال تتعلّق (Hang) بلا خطأ واضح، لين
+تتجاوز مهلة gunicorn (WORKER TIMEOUT) ويُقتَل الطلب بالكامل.
+
+**الحل**: إرسال عبر واجهة SendGrid البرمجية (HTTPS، منفذ 443 -- غير محجوب
+أبداً بأي منصة سحابية) بدل SMTP كلياً. الصور أيضاً صارت مُضمَّنة كـ Base64
+Data URI مباشرة بالـHTML (بدل CID/MIME منفصل) -- أبسط وتعمل مع أي مزوّد
+بريد إلكتروني بلا اعتماد على دعمه الخاص للصور المضمَّنة.
+
+يحتاج:
+  - حساب SendGrid مجاني (100 إيميل/يوم مجاناً بشكل دائم).
+  - تفعيل "Single Sender Verification" لعنوان بريد واحد فقط (بريدك
+    الشخصي مثلاً) من لوحة SendGrid -- يستغرق دقيقتين، لا يحتاج نطاقاً
+    (Domain) كاملاً.
+  - مفتاح API من SendGrid (Settings → API Keys → Create API Key).
   لا تُخزَّن بيانات الاعتماد داخل الكود إطلاقاً -- مرَّرها متغيرات بيئة
-  (راجع SMTPConfig.from_env أدناه).
+  (راجع EmailAPIConfig.from_env أدناه).
 """
 
 from __future__ import annotations
+import base64
 import io
 import os
-import smtplib
 from dataclasses import dataclass
-from email.mime.multipart import MIMEMultipart
-from email.mime.image import MIMEImage
-from email.mime.text import MIMEText
 
 import numpy as np
+import requests
 import matplotlib
 matplotlib.use("Agg")  # لا حاجة لواجهة رسومية على سيرفر السحابة
 import matplotlib.pyplot as plt
 
+SENDGRID_ENDPOINT = "https://api.sendgrid.com/v3/mail/send"
+
 
 # ============================================================
-# 1) إعدادات SMTP (من متغيرات البيئة -- لا كلمات مرور بالكود)
+# 1) إعدادات SendGrid (من متغيرات البيئة -- لا مفاتيح بالكود)
 # ============================================================
 @dataclass
-class SMTPConfig:
-    host: str
-    port: int
-    username: str
-    password: str
+class EmailAPIConfig:
+    api_key: str
     sender_email: str
-    use_tls: bool = True
 
     @classmethod
-    def from_env(cls) -> "SMTPConfig":
+    def from_env(cls) -> "EmailAPIConfig":
         """
         يقرأ الإعدادات من متغيرات البيئة:
-          ECG_SMTP_HOST     (مثال: smtp.gmail.com)
-          ECG_SMTP_PORT     (مثال: 587)
-          ECG_SMTP_USERNAME (عنوان البريد المُرسِل)
-          ECG_SMTP_PASSWORD (كلمة مرور التطبيق -- ليست كلمة المرور العادية)
-          ECG_SMTP_SENDER   (اختياري -- يساوي USERNAME افتراضياً)
+          ECG_SENDGRID_API_KEY  (من لوحة SendGrid: Settings → API Keys)
+          ECG_SENDGRID_SENDER   (بريد "Single Sender" الذي فعّلته بحسابك)
         """
-        host = os.environ["ECG_SMTP_HOST"]
-        port = int(os.environ.get("ECG_SMTP_PORT", "587"))
-        username = os.environ["ECG_SMTP_USERNAME"]
-        password = os.environ["ECG_SMTP_PASSWORD"]
-        sender = os.environ.get("ECG_SMTP_SENDER", username)
-        return cls(host=host, port=port, username=username, password=password, sender_email=sender)
+        return cls(
+            api_key=os.environ["ECG_SENDGRID_API_KEY"],
+            sender_email=os.environ["ECG_SENDGRID_SENDER"],
+        )
 
 
 # ============================================================
 # 2) شكل بياني لكل قطب (نبضة المريض الفعلية فوق المدى الطبيعي)
 # ============================================================
-def render_lead_figure(lead: str, beat: np.ndarray, ref_min: np.ndarray, ref_max: np.ndarray,
-                        cutoff: int, pre: int, predicted_class: str) -> bytes:
+def render_lead_figure_base64(lead: str, beat: np.ndarray, ref_min: np.ndarray, ref_max: np.ndarray,
+                               cutoff: int, pre: int, predicted_class: str) -> str:
     """
-    يرسم نبضة مريض واحد (بعد كل المعالجات: تمرير عالٍ، تصحيح محلي) فوق
-    المدى الطبيعي المظلَّل لنفس القطب، مع تظليل رمادي لأي جزء مقنَّع
-    (تجاوز نقطة القطع الديناميكية). يرجع الصورة كـ bytes (PNG) جاهزة
-    للتضمين المباشر بالإيميل (inline، لا كمرفق منفصل).
+    يرسم نبضة مريض واحد فوق المدى الطبيعي المظلَّل لنفس القطب، مع تظليل
+    رمادي لأي جزء مقنَّع (تجاوز نقطة القطع الديناميكية). يرجع الصورة
+    كسلسلة Base64 (بلا بادئة data:) جاهزة للتضمين المباشر بالـHTML.
 
     ⚠️ نصوص الشكل بالإنجليزية عمداً: matplotlib يعرض النص العربي معكوساً
     ومفكّكاً بلا مكتبات تشكيل إضافية (arabic_reshaper + python-bidi) غير
-    مضمونة التوفّر بكل بيئة سحابية. النص العربي بجسم الإيميل والجداول
-    (HTML) يُعرَض صحيحاً بشكل طبيعي عبر المتصفح/برنامج البريد، فلا داعي
-    لأي حل هنا سوى إبقاء نص الشكل نفسه إنجليزياً.
+    مضمونة التوفّر بكل بيئة سحابية.
     """
     length = len(beat)
     t_axis = np.arange(-pre, length - pre)
@@ -102,11 +102,11 @@ def render_lead_figure(lead: str, beat: np.ndarray, ref_min: np.ndarray, ref_max
     plt.savefig(buf, format="png", dpi=130)
     plt.close(fig)
     buf.seek(0)
-    return buf.read()
+    return base64.b64encode(buf.read()).decode("ascii")
 
 
 # ============================================================
-# 3) الجدولان (تفصيلي + مبسَّط)
+# 3) الجدولان (تفصيلي + مبسَّط) -- بلا تغيير عن النسخة السابقة
 # ============================================================
 def build_detailed_table_html(lead_results: dict[str, dict]) -> str:
     """
@@ -165,29 +165,34 @@ def build_summary_table_html(lead_results: dict[str, dict]) -> str:
 
 
 # ============================================================
-# 4) تجميع وإرسال الإيميل
+# 4) تجميع وإرسال الإيميل (عبر SendGrid API، لا SMTP)
 # ============================================================
-def generate_and_send_report(smtp_config: SMTPConfig, recipient_email: str,
+def generate_and_send_report(email_config: EmailAPIConfig, recipient_email: str,
                               patient_label: str, lead_results: dict[str, dict],
-                              pre: int = 100) -> None:
+                              pre: int = 100, timeout_seconds: int = 15) -> None:
     """
     lead_results: {اسم القطب: {"predicted": الفئة, "probs": {...},
                                 "beat": np.ndarray, "ref_min": np.ndarray,
                                 "ref_max": np.ndarray, "cutoff": int}}
-    (نفس المخرجات المتوفرة أصلاً بعد استدعاء LeadModel.predict_beat لكل قطب --
-    فقط أضِف "beat"/"ref_min"/"ref_max"/"cutoff" من نفس الكائن LeadModel
-    المستخدَم بالتصنيف، هذي القيم أصلاً محفوظة عنده كـ self.ref_min/ref_max).
 
-    يبني شكلاً لكل قطب + الجدولين، ويُرسل إيميل HTML واحد بكل شيء مضمَّناً.
+    يبني شكلاً لكل قطب (مُضمَّن Base64 مباشرة بالـHTML) + الجدولين،
+    ويُرسل عبر SendGrid API (طلب HTTPS واحد، منفذ 443). يرفع استثناءً
+    عادياً عند أي فشل (شبكة، رفض المفتاح، تجاوز الحصة اليومية...) --
+    المستدعي (app.py) مسؤول عن الإمساك به وتسجيل الحالة دون إسقاط الطلب
+    الأساسي (التصنيف نفسه يجب أن ينجح حتى لو فشل الإيميل).
+
+    timeout_seconds: مهلة قصوى لطلب SendGrid نفسه (منفصلة تماماً عن أي
+    قيد SMTP سابق) -- تحمي من تعليق الطلب الأساسي حتى لو تعطّلت خدمة
+    SendGrid نفسها لأي سبب.
     """
-    images_cid = {}
     images_html = ""
-    for i, (lead, r) in enumerate(lead_results.items()):
-        cid = f"lead_fig_{i}"
-        png_bytes = render_lead_figure(lead, r["beat"], r["ref_min"], r["ref_max"],
-                                        r["cutoff"], pre, r["predicted"])
-        images_cid[cid] = png_bytes
-        images_html += f"<img src='cid:{cid}' style='max-width:600px;display:block;margin:8px 0'/>"
+    for lead, r in lead_results.items():
+        b64_png = render_lead_figure_base64(lead, r["beat"], r["ref_min"], r["ref_max"],
+                                             r["cutoff"], pre, r["predicted"])
+        images_html += (
+            f"<img src='data:image/png;base64,{b64_png}' "
+            f"style='max-width:600px;display:block;margin:8px 0'/>"
+        )
 
     detailed_table = build_detailed_table_html(lead_results)
     summary_table = build_summary_table_html(lead_results)
@@ -209,19 +214,16 @@ def generate_and_send_report(smtp_config: SMTPConfig, recipient_email: str,
     </body></html>
     """
 
-    msg = MIMEMultipart("related")
-    msg["Subject"] = f"ECG Classification Report — {patient_label}"
-    msg["From"] = smtp_config.sender_email
-    msg["To"] = recipient_email
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
-    for cid, png_bytes in images_cid.items():
-        img = MIMEImage(png_bytes, _subtype="png")
-        img.add_header("Content-ID", f"<{cid}>")
-        img.add_header("Content-Disposition", "inline", filename=f"{cid}.png")
-        msg.attach(img)
-
-    with smtplib.SMTP(smtp_config.host, smtp_config.port) as server:
-        if smtp_config.use_tls:
-            server.starttls()
-        server.login(smtp_config.username, smtp_config.password)
-        server.send_message(msg)
+    payload = {
+        "personalizations": [{"to": [{"email": recipient_email}]}],
+        "from": {"email": email_config.sender_email},
+        "subject": f"ECG Classification Report — {patient_label}",
+        "content": [{"type": "text/html", "value": html_body}],
+    }
+    headers = {
+        "Authorization": f"Bearer {email_config.api_key}",
+        "Content-Type": "application/json",
+    }
+    response = requests.post(SENDGRID_ENDPOINT, json=payload, headers=headers, timeout=timeout_seconds)
+    if response.status_code >= 400:
+        raise RuntimeError(f"SendGrid rejected the request ({response.status_code}): {response.text[:500]}")

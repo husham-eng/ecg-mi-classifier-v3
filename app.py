@@ -30,7 +30,7 @@ from werkzeug.utils import secure_filename
 from ecg_pipeline import (classify_patient, classify_from_image, classify_lead_signal,
                            combine_lead_probabilities, SUPPORTED_LEADS)
 from ecg_pipeline.panel_detector import detect_panel_leads
-from ecg_pipeline.email_report import generate_and_send_report, SMTPConfig
+from ecg_pipeline.email_report import generate_and_send_report, EmailAPIConfig
 from translations import get_translation, DEFAULT_LANG
 
 app = Flask(__name__)
@@ -42,14 +42,18 @@ app.secret_key = os.environ.get("SECRET_KEY", "dev-only-change-me-on-render")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "changeme123")
 
 # ⚠️ ميزة تقرير الإيميل (جلسة الدراسة الميدانية): تحتاج متغيّرات بيئة
-# ECG_SMTP_HOST / ECG_SMTP_PORT / ECG_SMTP_USERNAME / ECG_SMTP_PASSWORD
-# (راجع توثيق SMTPConfig.from_env بـ ecg_pipeline/email_report.py). إن لم
-# تُضبَط، تبقى الميزة معطَّلة تلقائياً (لا خطأ يوقف التطبيق) -- أي طلب فيه
-# doctor_email سيُرجع تحذيراً بالنتيجة بدل إرسال فعلي، حتى تُضبَط الإعدادات.
+# ECG_SENDGRID_API_KEY / ECG_SENDGRID_SENDER (راجع توثيق EmailAPIConfig.from_env
+# بـ ecg_pipeline/email_report.py). ⚠️ لا تستخدم SMTP -- جُرِّب فعلياً على
+# Render وتبيّن أن منصات الاستضافة السحابية تحجب منافذ SMTP الصادرة
+# (25/465/587)، فيتعلّق الطلب حتى تنتهي مهلة gunicorn (WORKER TIMEOUT)
+# ويفشل التصنيف كاملاً معه، لا الإيميل وحده. SendGrid يرسل عبر HTTPS
+# (منفذ 443، غير محجوب أبداً). إن لم تُضبَط المتغيّرات، تبقى الميزة
+# معطَّلة تلقائياً (لا خطأ يوقف التطبيق) -- أي طلب فيه doctor_email
+# سيُرجع تحذيراً بالنتيجة بدل إرسال فعلي، حتى تُضبَط الإعدادات.
 try:
-    _SMTP_CONFIG = SMTPConfig.from_env()
+    _EMAIL_CONFIG = EmailAPIConfig.from_env()
 except KeyError:
-    _SMTP_CONFIG = None
+    _EMAIL_CONFIG = None
 
 # ⚠️ تنبيه مهم: هذا المجلد على قرص مؤقت (Ephemeral) بمعظم منصات الاستضافة
 # المجانية (بما فيها Render Free) — يُمسَح بالكامل عند كل إعادة نشر أو
@@ -274,12 +278,12 @@ def classify():
                 "cutoff": r["representative_cutoff"],
             }
         if lead_results_for_email:
-            if _SMTP_CONFIG is None:
-                result["email_status"] = ("لم يُرسَل: إعدادات SMTP غير مضبوطة على السيرفر "
-                                           "(راجع متغيّرات ECG_SMTP_* بالبيئة).")
+            if _EMAIL_CONFIG is None:
+                result["email_status"] = ("لم يُرسَل: إعدادات SendGrid غير مضبوطة على السيرفر "
+                                           "(راجع متغيّرات ECG_SENDGRID_* بالبيئة).")
             else:
                 try:
-                    generate_and_send_report(_SMTP_CONFIG, doctor_email,
+                    generate_and_send_report(_EMAIL_CONFIG, doctor_email,
                                               patient_label=f"recording_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}",
                                               lead_results=lead_results_for_email)
                     result["email_status"] = f"أُرسل تقرير مفصَّل إلى {doctor_email}."
